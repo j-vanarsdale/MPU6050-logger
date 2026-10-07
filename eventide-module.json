@@ -1,0 +1,94 @@
+{
+  "name": "mpu6050-imu",
+  "version": "1.0.0",
+  "description": "MPU-6050 IMU datalogger: 6-axis + temperature sampling over I2C, roll/pitch/yaw estimate, CSV recording, live HTTP API.",
+
+  "dependencies": {
+    "apt": ["i2c-tools"],
+    "system_site_packages": true,
+    "commands": [
+      "test -e /dev/i2c-1 || echo 'WARNING: /dev/i2c-1 not found - enable I2C (raspi-config nonint do_i2c 0) and reboot'"
+    ]
+  },
+
+  "recordings_subdir": "imu",
+
+  "arguments": [
+    { "name": "i2c_bus", "flag": "--bus", "type": "int", "default": 1,
+      "description": "I2C bus number (/dev/i2c-N). Pi header pins 3/5 are bus 1." },
+    { "name": "i2c_addr", "flag": "--addr", "type": "int", "default": 104,
+      "description": "I2C address in decimal. 104 = 0x68 (AD0 low), 105 = 0x69 (AD0 high)." },
+    { "name": "sample_rate", "flag": "--rate", "type": "int", "default": 100,
+      "description": "Sample rate in Hz (1-1000). Python timing gets jittery above ~400 Hz." },
+    { "name": "accel_range", "flag": "--accel-range", "type": "int", "default": 4,
+      "description": "Accelerometer full-scale range in g: 2, 4, 8 or 16." },
+    { "name": "gyro_range", "flag": "--gyro-range", "type": "int", "default": 500,
+      "description": "Gyroscope full-scale range in deg/s: 250, 500, 1000 or 2000." },
+    { "name": "dlpf", "flag": "--dlpf", "type": "int", "default": 3,
+      "description": "Hardware low-pass filter setting 0-6 (0 = 260 Hz off ... 6 = 5 Hz). 3 = ~44 Hz." },
+    { "name": "filter_alpha", "flag": "--alpha", "type": "float", "default": 0.98,
+      "description": "Complementary filter gyro weight (0-1). Higher trusts the gyro more." },
+    { "name": "calibrate_on_start", "flag": "--calibrate-on-start", "type": "int", "default": 1,
+      "description": "1 = estimate gyro bias for ~2 s at startup (sensor must be still), 0 = skip." },
+    { "name": "autorecord", "flag": "--autorecord", "type": "int", "default": 0,
+      "description": "1 = start CSV recording as soon as the program starts, 0 = wait for a record command." },
+    { "name": "segment_seconds", "flag": "--segment-seconds", "type": "int", "default": 600,
+      "description": "Start a new CSV file every N seconds while recording (0 = one file per recording)." },
+    { "name": "host", "flag": "--host", "type": "str", "default": "127.0.0.1",
+      "description": "HTTP API bind address. The dashboard proxy only needs 127.0.0.1." }
+  ],
+
+  "sockets": [
+    { "name": "http_api", "type": "tcp",
+      "description": "IMU JSON API (data, settings, recording, calibration)" }
+  ],
+
+  "programs": [
+    {
+      "name": "mpu6050_logger",
+      "command": "{venv_python} -u {module_dir}/mpu6050_logger.py --bus {arg:i2c_bus} --addr {arg:i2c_addr} --rate {arg:sample_rate} --accel-range {arg:accel_range} --gyro-range {arg:gyro_range} --dlpf {arg:dlpf} --alpha {arg:filter_alpha} --calibrate-on-start {arg:calibrate_on_start} --autorecord {arg:autorecord} --segment-seconds {arg:segment_seconds} --host {arg:host} --port {socket:http_api} --output-dir {recordings_subdir}",
+      "directory": "{module_dir}",
+      "priority": 5,
+      "instance": { "argument": "i2c_addr", "label": "I2C address (decimal: 104 = 0x68, 105 = 0x69)" }
+    }
+  ],
+
+  "ui": [
+    { "id": "attitude", "type": "orientation3d", "title": "IMU ATTITUDE",
+      "region": "center", "default": true, "socket": "http_api",
+      "get": "/api/data", "interval": 100,
+      "paths": { "pan": "yaw", "tilt": "pitch", "roll": "roll" } },
+
+    { "id": "readout", "type": "telemetry", "title": "IMU READOUT",
+      "region": "sidebar", "default": true, "socket": "http_api",
+      "get": "/api/data", "interval": 250,
+      "rows": [
+        { "label": "ACCEL X (g)",  "path": "ax",       "fmt": "f2" },
+        { "label": "ACCEL Y (g)",  "path": "ay",       "fmt": "f2" },
+        { "label": "ACCEL Z (g)",  "path": "az",       "fmt": "f2" },
+        { "label": "GYRO X (°/s)", "path": "gx",       "fmt": "f1" },
+        { "label": "GYRO Y (°/s)", "path": "gy",       "fmt": "f1" },
+        { "label": "GYRO Z (°/s)", "path": "gz",       "fmt": "f1" },
+        { "label": "ROLL (°)",     "path": "roll",     "fmt": "f1" },
+        { "label": "PITCH (°)",    "path": "pitch",    "fmt": "f1" },
+        { "label": "YAW (°)",      "path": "yaw",      "fmt": "f1" },
+        { "label": "TEMP (°C)",    "path": "temp_c",   "fmt": "f1" },
+        { "label": "RATE (Hz)",    "path": "rate_hz",  "fmt": "f1" }
+      ] },
+
+    { "id": "imu-settings", "type": "form", "title": "IMU SETTINGS",
+      "region": "sidebar", "default": true, "socket": "http_api",
+      "get": "/api/settings", "put": "/api/settings",
+      "fields": [
+        { "key": "sample_rate",  "label": "Sample rate (Hz)",   "kind": "number", "min": 1, "max": 1000 },
+        { "key": "accel_range",  "label": "Accel range (g)",    "kind": "number", "min": 2, "max": 16 },
+        { "key": "gyro_range",   "label": "Gyro range (°/s)",   "kind": "number", "min": 250, "max": 2000 },
+        { "key": "dlpf",         "label": "Low-pass filter",    "kind": "slider", "min": 0, "max": 6, "step": 1 },
+        { "key": "filter_alpha", "label": "Filter gyro weight", "kind": "slider", "min": 0, "max": 1, "step": 0.005 }
+      ] },
+
+    { "id": "record-control", "type": "recording", "title": "IMU RECORD",
+      "region": "sidebar", "default": true, "socket": "http_api",
+      "get": "/api/recording", "put": "/api/recording" }
+  ]
+}
