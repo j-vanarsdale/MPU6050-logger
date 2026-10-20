@@ -5,7 +5,7 @@ One foreground process, managed by supervisord:
 
   * a sampler thread that reads the sensor over I2C at a fixed rate, applies
     bias correction and a complementary filter (roll / pitch / yaw estimate),
-  * a CSV recorder with segment rotation (files land in --output-dir, which the
+  * a JSONL recorder with segment rotation (files land in --output-dir, which the
     PLAYBACK tab lists),
   * a small JSON HTTP API (stdlib only) that the dashboard reaches through
     /proxy/<module>/http_api/...
@@ -15,7 +15,6 @@ installs and hot-plugging work. Use --simulate to run without hardware.
 """
 
 import argparse
-import csv
 import json
 import math
 import os
@@ -25,6 +24,7 @@ import sys
 import threading
 import time
 import traceback
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -44,13 +44,16 @@ ACCEL_RANGES = {2: (0, 16384.0), 4: (1, 8192.0), 8: (2, 4096.0), 16: (3, 2048.0)
 GYRO_RANGES = {250: (0, 131.0), 500: (1, 65.5), 1000: (2, 32.8), 2000: (3, 16.4)}
 EXPECTED_WHO_AM_I = {0x68, 0x70, 0x71, 0x72}  # 0x68 genuine; others are common clones
 
-CSV_HEADER = ["t_unix", "t_mono", "ax_g", "ay_g", "az_g",
-              "gx_dps", "gy_dps", "gz_dps", "temp_c",
-              "roll_deg", "pitch_deg", "yaw_deg"]
 
 
 def log(msg):
     print(f"[mpu6050] {msg}", flush=True)
+
+
+def utc_iso(t_ns):
+    """Epoch nanoseconds -> 'YYYY-MM-DDTHH:MM:SS.ffffffZ'."""
+    dt = datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 def wrap180(angle):
@@ -136,14 +139,14 @@ class SimBus:
         pass
 
 
-# --- CSV recorder -----------------------------------------------------------
+# --- JSONL recorder ---------------------------------------------------------
 class Recorder:
     def __init__(self, out_dir, segment_seconds):
         self.out_dir = out_dir
         self.segment_seconds = segment_seconds
         self._lock = threading.Lock()
         self._fh = None
-        self._writer = None
+        self.header_fn = None  # set in main(): returns the header dict for a new file
         self._seg_start = 0.0
         self._last_flush = 0.0
         self._stop_at = None
@@ -153,13 +156,17 @@ class Recorder:
 
     def _open_segment(self):
         os.makedirs(self.out_dir, exist_ok=True)
-        name = time.strftime("imu_%Y%m%d_%H%M%S.csv", time.gmtime())
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        name = f"mpu6050_{stamp}.jsonl"
         path = os.path.join(self.out_dir, name)
-        new = not os.path.exists(path)
-        self._fh = open(path, "a", newline="")
-        self._writer = csv.writer(self._fh, lineterminator="\n")
-        if new:
-            self._writer.writerow(CSV_HEADER)
+        n = 1
+        while os.path.exists(path):  # stop/start inside the same second
+            name = f"mpu6050_{stamp}_{n}.jsonl"
+            path = os.path.join(self.out_dir, name)
+            n += 1
+        self._fh = open(path, "w", encoding="utf-8")
+        if self.header_fn:
+            self._fh.write(json.dumps(self.header_fn(), separators=(",", ":")) + "\n")
         self._seg_start = self._last_flush = time.monotonic()
         self.current_file = name
         log(f"recording -> {path}")
@@ -170,8 +177,8 @@ class Recorder:
                 self._fh.flush()
                 self._fh.close()
             except OSError as exc:
-                log(f"error closing CSV: {exc}")
-        self._fh = self._writer = None
+                log(f"error closing recording file: {exc}")
+        self._fh = None
         self.active = False
         self._stop_at = None
         self.current_file = None
@@ -204,7 +211,7 @@ class Recorder:
                 if self.segment_seconds and now - self._seg_start >= self.segment_seconds:
                     self._fh.close()
                     self._open_segment()
-                self._writer.writerow(row)
+                self._fh.write(json.dumps(row, separators=(",", ":")) + "\n")
                 if now - self._last_flush >= 1.0:
                     self._fh.flush()
                     self._last_flush = now
@@ -227,6 +234,8 @@ class Sampler(threading.Thread):
         self.settings = dict(settings)
         self.recorder = recorder
         self.calibrate_on_start = bool(calibrate_on_start)
+        self.autorecord = False          # set by main(); recording begins once the sensor is ready
+        self._autorecord_done = False
 
         self._halt = threading.Event()
         self._lock = threading.Lock()
@@ -281,6 +290,26 @@ class Sampler(threading.Thread):
                 self._cal = None
         res = cal["result"] or {"ok": False, "error": "calibration timed out"}
         return (200 if res.get("ok") else 409), res
+
+    def recording_header(self):
+        """First line of every recording file (called under the recorder lock)."""
+        s = self.settings
+        t_ns = time.time_ns()
+        return {
+            "type": "header", "format": "eventide-imu-jsonl", "version": 1,
+            "sensor": "MPU-6050",
+            "start_utc": utc_iso(t_ns), "start_ns": t_ns,
+            "timebase": "t_ns / t_utc = system UTC clock (CLOCK_REALTIME) when the sample was processed",
+            "sample_rate_hz": s["sample_rate"], "accel_range_g": s["accel_range"],
+            "gyro_range_dps": s["gyro_range"], "dlpf": s["dlpf"],
+            "filter_alpha": s["filter_alpha"],
+            "units": {"accel_g": "g", "gyro_dps": "deg/s", "temp_c": "C", "angles": "deg"},
+            "corrections": "accel/gyro are bias-corrected using the values below",
+            "gyro_bias_dps": [round(v, 4) for v in self.gyro_bias],
+            "accel_bias_g": [round(v, 5) for v in self.accel_bias],
+            "calibrated": self.calibrated,
+            "yaw_note": "yaw is integrated gyro only (no magnetometer) and drifts",
+        }
 
     def status(self):
         return {
@@ -341,8 +370,17 @@ class Sampler(threading.Thread):
             self._startup_cal_done = True
             with self._lock:
                 self._cal = {"seconds": 2.0, "accel": False, "event": threading.Event(),
-                             "samples": [], "end": None, "result": None, "wait": False}
+                             "samples": [], "end": None, "result": None, "wait": False,
+                             "startup": True}
             log("startup calibration: keep the sensor still for ~2 s")
+        else:
+            self._maybe_autorecord()
+
+    def _maybe_autorecord(self):
+        """--autorecord: begin recording once, after the sensor is up (and calibrated)."""
+        if self.autorecord and not self._autorecord_done:
+            self._autorecord_done = True
+            self.recorder.start()
 
     def _apply_regs(self, bus):
         s = self.settings
@@ -432,9 +470,9 @@ class Sampler(threading.Thread):
             self.yaw = wrap180(self.yaw + gz * dt)  # gyro-only: drifts, no magnetometer
 
         self.sample_count += 1
-        now_unix = time.time()
+        t_ns = time.time_ns()
         self.latest = {
-            "ok": True, "timestamp": round(now_unix, 6),
+            "ok": True, "timestamp": round(t_ns / 1e9, 6), "t_utc": utc_iso(t_ns),
             "ax": round(ax, 5), "ay": round(ay, 5), "az": round(az, 5),
             "gx": round(gx, 4), "gy": round(gy, 4), "gz": round(gz, 4),
             "temp_c": round(temp, 2),
@@ -443,12 +481,14 @@ class Sampler(threading.Thread):
             "calibrated": self.calibrated, "recording": self.recorder.active,
         }
         if self.recorder.active:
-            self.recorder.write([
-                f"{now_unix:.6f}", f"{time.monotonic():.6f}",
-                f"{ax:.5f}", f"{ay:.5f}", f"{az:.5f}",
-                f"{gx:.4f}", f"{gy:.4f}", f"{gz:.4f}", f"{temp:.2f}",
-                f"{self.roll:.3f}", f"{self.pitch:.3f}", f"{self.yaw:.3f}",
-            ])
+            self.recorder.write({
+                "t_utc": utc_iso(t_ns), "t_ns": t_ns, "seq": self.sample_count,
+                "accel_g": {"x": round(ax, 5), "y": round(ay, 5), "z": round(az, 5)},
+                "gyro_dps": {"x": round(gx, 4), "y": round(gy, 4), "z": round(gz, 4)},
+                "temp_c": round(temp, 2),
+                "roll_deg": round(self.roll, 3), "pitch_deg": round(self.pitch, 3),
+                "yaw_deg": round(self.yaw, 3),
+            })
 
     # ---- calibration ----
     def _feed_calibration(self, a_raw, g_raw, t):
@@ -460,6 +500,8 @@ class Sampler(threading.Thread):
         cal["samples"].append(a_raw + g_raw)
         if t >= cal["end"]:
             cal["result"] = self._finish_calibration(cal)
+            if cal.get("startup"):
+                self._maybe_autorecord()   # success or not: don't wait forever
             with self._lock:
                 if self._cal is cal:
                     self._cal = None
@@ -651,9 +693,9 @@ def main():
 
     recorder = Recorder(args.output_dir, args.segment_seconds)
     sampler = Sampler(bus_factory, args.addr, settings, recorder, args.calibrate_on_start)
+    recorder.header_fn = sampler.recording_header
+    sampler.autorecord = bool(args.autorecord)
     sampler.start()
-    if args.autorecord:
-        recorder.start()
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(sampler, recorder))
     server.daemon_threads = True
@@ -670,7 +712,7 @@ def main():
         server.serve_forever()
     finally:
         sampler.stop()
-        recorder.stop()  # flush the CSV so a supervisor stop never loses data
+        recorder.stop()  # flush the recording so a supervisor stop never loses data
         log("stopped")
 
 

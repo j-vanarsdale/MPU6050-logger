@@ -1,7 +1,7 @@
 # mpu6050-imu
 
 Eventide module for an **MPU-6050** 6-axis IMU on I2C. It samples accel, gyro and
-temperature at a fixed rate, estimates roll/pitch/yaw, records CSV logs, and
+temperature at a fixed rate, estimates roll/pitch/yaw, records UTC-timestamped JSONL logs, and
 serves a JSON API that the dashboard widgets use.
 
 ## Wiring (Raspberry Pi)
@@ -39,7 +39,7 @@ program command.
 | IMU ATTITUDE     | centre  | 3D attitude view (yaw → pan, pitch → tilt, roll → roll) |
 | IMU READOUT      | sidebar | live accel / gyro / angles / temperature / actual sample rate |
 | IMU SETTINGS     | sidebar | sample rate, accel & gyro range, low-pass filter, filter weight |
-| IMU RECORD       | sidebar | start/stop CSV recording; also driven by MASTER RECORD |
+| IMU RECORD       | sidebar | start/stop recording; also driven by MASTER RECORD |
 
 ## Arguments
 
@@ -55,8 +55,8 @@ Install-time defaults (editable from the MODULES tab; editing restarts the progr
 | `dlpf`               | `3`         | hardware low-pass, 0 (wide) … 6 (5 Hz) |
 | `filter_alpha`       | `0.98`      | complementary filter gyro weight |
 | `calibrate_on_start` | `1`         | gyro-bias estimate at startup (needs the sensor still; skipped with a log line if it is moving) |
-| `autorecord`         | `0`         | `1` = record from program start |
-| `segment_seconds`    | `600`       | new CSV every N seconds while recording; `0` = one file |
+| `autorecord`         | `0`         | `1` = record from program start (after the startup calibration finishes) |
+| `segment_seconds`    | `600`       | new file every N seconds while recording; `0` = one file |
 | `host`               | `127.0.0.1` | API bind address (the dashboard proxy only needs localhost) |
 
 Settings changed live through the SETTINGS form or `PUT /api/settings` apply
@@ -66,21 +66,36 @@ immediately but are **not persisted**; edit the arguments to change the boot def
 
 The program is copyable on `i2c_addr`. Put the second MPU-6050 on the same bus
 with AD0 high and use **ADD COPY** with value `105`. The copy gets its own API
-port, widgets and `imu-105` recording directory. (Copies are identified by
+port, widgets and `mpu6050-105` recording directory. (Copies are identified by
 address, so two sensors that share an address on different buses can't both be
 copies of this program.)
 
 ## Recordings
 
-Files go to `<recordings_dir>/imu/imu_YYYYMMDD_HHMMSS.csv` (UTC) and appear in
-the PLAYBACK tab.
+**Nothing is written until recording is started** — press IMU RECORD (or MASTER RECORD),
+or set `autorecord` to `1`. Files go to `<recordings_dir>/mpu6050/mpu6050_<UTC start>.jsonl`
+and appear in the PLAYBACK tab (which only lists `.jsonl`, `.raw`, `.mp4`, `.h264` and
+`.basler` files).
 
-```
-t_unix,t_mono,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,temp_c,roll_deg,pitch_deg,yaw_deg
+Line 1 of each file is a header (sensor settings, calibration state and biases); every
+following line is one sample:
+
+```json
+{"type":"header","format":"eventide-imu-jsonl","version":1,"sensor":"MPU-6050","start_utc":"...Z","sample_rate_hz":100,"calibrated":true,"gyro_bias_dps":[0.8,-0.5,0.3],...}
+{"t_utc":"2026-10-19T23:51:17.512345Z","t_ns":1792453877512345678,"seq":212,"accel_g":{"x":0.001,"y":0.0,"z":1.003},"gyro_dps":{"x":0.0,"y":-0.02,"z":0.01},"temp_c":25.0,"roll_deg":0.0,"pitch_deg":0.0,"yaw_deg":0.01}
 ```
 
-Accel/gyro/angles are bias-corrected. `t_unix` is wall-clock time (as good as
-the payload RTC); `t_mono` is a monotonic clock for computing intervals.
+Accel/gyro/angles are bias-corrected. `t_utc` / `t_ns` come from the system UTC clock
+(as good as the payload RTC/NTP); use `t_ns` to merge with other sensors.
+
+## Calibration
+
+* **Gyro bias** is estimated for ~2 s at startup (`calibrate_on_start`). Keep the sensor
+  still; if it moves the attempt is rejected and the program carries on uncalibrated.
+  It runs once per program start, not on sensor reconnects. Re-run any time with
+  `POST /api/calibrate`.
+* **Accel offsets** are not corrected unless you call `/api/calibrate` with
+  `{"accel": true}` with the sensor level, Z up.
 
 ## API
 

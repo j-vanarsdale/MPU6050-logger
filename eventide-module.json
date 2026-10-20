@@ -1,7 +1,7 @@
 {
   "name": "mpu6050-imu",
   "version": "1.0.0",
-  "description": "MPU-6050 IMU datalogger: 6-axis + temperature sampling over I2C, roll/pitch/yaw estimate, CSV recording, live HTTP API.",
+  "description": "MPU-6050 IMU datalogger: 6-axis + temperature sampling over I2C, roll/pitch/yaw estimate, JSONL recording, live HTTP API.",
 
   "dependencies": {
     "apt": ["i2c-tools"],
@@ -11,7 +11,7 @@
     ]
   },
 
-  "recordings_subdir": "imu",
+  "recordings_subdir": "mpu6050",
 
   "arguments": [
     { "name": "i2c_bus", "flag": "--bus", "type": "int", "default": 1,
@@ -31,9 +31,9 @@
     { "name": "calibrate_on_start", "flag": "--calibrate-on-start", "type": "int", "default": 1,
       "description": "1 = estimate gyro bias for ~2 s at startup (sensor must be still), 0 = skip." },
     { "name": "autorecord", "flag": "--autorecord", "type": "int", "default": 0,
-      "description": "1 = start CSV recording as soon as the program starts, 0 = wait for a record command." },
+      "description": "1 = start JSONL recording as soon as the program starts, 0 = wait for a record command." },
     { "name": "segment_seconds", "flag": "--segment-seconds", "type": "int", "default": 600,
-      "description": "Start a new CSV file every N seconds while recording (0 = one file per recording)." },
+      "description": "Start a new recording file every N seconds while recording (0 = one file per recording)." },
     { "name": "host", "flag": "--host", "type": "str", "default": "127.0.0.1",
       "description": "HTTP API bind address. The dashboard proxy only needs 127.0.0.1." }
   ],
